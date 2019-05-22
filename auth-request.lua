@@ -21,37 +21,9 @@
 -- SOFTWARE.
 
 local http = require("socket.http")
-
---- Monkey Patches around bugs in haproxy's Socket class
--- This function calls core.tcp(), fixes a few methods and
--- returns the resulting socket.
--- @return Socket
-function create_sock()
-	local sock = core.tcp()
-
-	-- https://www.mail-archive.com/haproxy@formilux.org/msg28574.html
-	sock.old_receive = sock.receive
-	sock.receive = function(socket, pattern, prefix)
-		local a, b
-		if pattern == nil then pattern = "*l" end
-		if prefix == nil then
-			a, b = sock:old_receive(pattern)
-		else
-			a, b = sock:old_receive(pattern, prefix)
-		end
-		return a, b
-	end
-
-	-- https://www.mail-archive.com/haproxy@formilux.org/msg28604.html
-	sock.old_settimeout = sock.settimeout
-	sock.settimeout = function(socket, timeout)
-		socket:old_settimeout(timeout)
-
-		return 1
-	end
-
-	return sock
-end
+local JSON = require("JSON")
+local ltn12 = require("ltn12")
+local claims_map = Map.new("/etc/haproxy/auth-request.map", Map._str)
 
 core.register_action("auth-request", { "http-req" }, function(txn, be, path)
 	txn:set_var("txn.auth_response_successful", false)
@@ -94,11 +66,14 @@ core.register_action("auth-request", { "http-req" }, function(txn, be, path)
 		end
 	end
 
+	local t = {}
+
 	-- Make request to backend.
 	local b, c, h = http.request {
 		url = "http://" .. addr .. path,
 		headers = headers,
-		create = create_sock,
+		create = core.tcp,
+		sink = ltn12.sink.table(t),
 		-- Disable redirects, because DNS does not work here.
 		redirect = false
 	}
@@ -114,6 +89,20 @@ core.register_action("auth-request", { "http-req" }, function(txn, be, path)
 	if 200 <= c and c < 300 then
 		txn:set_var("txn.auth_response_successful", true)
 		txn:set_var("txn.auth_response_code", c)
+		-- if we got a JSON response, decode it
+		if h["content-type"] == "application/json" then
+			local json_string = table.concat(t)
+			local json = JSON:decode(json_string)
+			if json ~= nil then
+				-- Based on data in the loaded map (if any), set variables
+				for key,value in pairs(json.data) do
+					local claim_var = claims_map:lookup(key)
+					if claim_var ~= nil then
+						txn:set_var(claim_var, value[1])
+					end
+				end
+			end
+		end
 	-- 401 / 403: Do not allow request.
 	elseif c == 401 or c == 403 then
 		txn:set_var("txn.auth_response_code", c)
