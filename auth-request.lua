@@ -23,7 +23,30 @@
 local http = require("socket.http")
 local JSON = require("JSON")
 local ltn12 = require("ltn12")
-local claims_map = Map.new("/etc/haproxy/auth-request.map", Map._str)
+
+-- map containing json keys to variables
+local json_map = Map.new("/etc/haproxy/maps/auth-request.map", Map._str)
+-- map containing variables to headers
+local header_map = Map.new("/etc/haproxy/maps/auth-request_headers.map", Map._str)
+
+core.register_action("auth-request_set_header", { "http-req" }, function(txn, hdr)
+	local v = header_map:lookup(hdr)
+	-- ensure header is deleted
+	txn.http:req_del_header(hdr)
+	if v ~= nil then
+		local value = txn:get_var(v)
+		if value ~= nil then
+			-- set header
+			txn.http:req_set_header(hdr, value)
+		else
+			-- variable not set
+			txn:Info("Variable '" .. v .. "' not set")
+		end
+	else
+		-- not found in map
+		txn:Info("Mapping for '" .. hdr .. "' not found")
+	end
+end, 1)
 
 core.register_action("auth-request", { "http-req" }, function(txn, be, path)
 	txn:set_var("txn.auth_response_successful", false)
@@ -96,9 +119,9 @@ core.register_action("auth-request", { "http-req" }, function(txn, be, path)
 			if json ~= nil then
 				-- Based on data in the loaded map (if any), set variables
 				for key,value in pairs(json.data) do
-					local claim_var = claims_map:lookup(key)
-					if claim_var ~= nil then
-						txn:set_var(claim_var, value[1])
+					local v = json_map:lookup(key)
+					if v ~= nil then
+						txn:set_var(v, value[1])
 					end
 				end
 			end
